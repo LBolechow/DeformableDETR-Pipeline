@@ -1,0 +1,31 @@
+model:
+  id: SenseTime/deformable-detr
+  image_size: 640
+
+training:
+  batch_size: 2
+  accumulation_steps: 8
+  epochs: 200
+  learning_rate: 2.0e-4
+  weight_decay: 1.0e-4
+  grad_clip_norm: 0.1
+  patience: 50
+  seed: 42
+  resume: true
+  amp_dtype: bfloat16
+
+paths:
+  annotations_dir: annotations
+  images_dir: images
+  train_images: Train
+  val_images: Validation
+  train_json: instances_Train.json
+  val_json: instances_Validation.json
+  output_best: detr_best.pth
+  output_last: detr_last.pth
+  checkpoint: detr_last_checkpoint.pth
+  csv_log: training_results_detr.csv
+
+dataloader:
+  num_workers: 4
+  pin_memory: true
