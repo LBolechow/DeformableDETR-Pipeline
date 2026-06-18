@@ -1,219 +1,131 @@
-# Deformable DETR Training Pipeline
+# LEGO Brick Detection with Deformable DETR
 
-## Overview
+Part of a broader comparative study on CNN vs. Transformer-based object detection architectures. This repo contains the Deformable DETR training pipeline, built on top of the HuggingFace `transformers` implementation of `SenseTime/deformable-detr`, with a custom data pipeline and COCO-format evaluation.
 
-This repository provides a full training and evaluation pipeline for object detection using the Deformable DETR architecture from the Hugging Face Transformers library. The implementation is designed for COCO-format datasets and supports efficient training through mixed precision, gradient accumulation, and checkpointing.
+For context on the full study and dataset, see the [EfficientDet D1 repo](#).
 
-The pipeline is suitable for research experiments as well as production-oriented training workflows.
+## The Model
 
----
+Deformable DETR addresses the two main weaknesses of the original DETR: extremely slow convergence (10-20x more epochs than Faster R-CNN) and poor detection of small objects caused by the quadratic cost of full self-attention on high-resolution feature maps.
 
-## Features
+The fix is a deformable attention mechanism that only samples a small set of key points around a reference point instead of attending to the entire feature map. Combined with multi-scale attention across all FPN levels simultaneously, this cuts training time significantly and improves small object precision.
 
-* Deformable DETR model via Hugging Face Transformers
-* COCO-format dataset support
-* Automatic mixed precision (AMP) with bfloat16
-* Gradient accumulation for memory efficiency
-* Cosine annealing learning rate scheduling
-* Early stopping based on validation mAP
-* Resume training from checkpoints
-* COCO evaluation metrics (mAP, AR)
-* CSV-based logging
+In practice on this dataset: converged in 200 epochs with no early stopping trigger, and despite looking unimpressive on the validation set, it achieved the **best mAP@50-95 on the held-out test set** across all five compared architectures — at the cost of the longest inference time in the comparison (79.2ms/image).
 
----
+## The Study
+
+Five architectures compared on a custom synthetic LEGO dataset:
+
+**CNN-based:** Faster R-CNN (ResNet-50), EfficientDet D1, YOLOv8s
+
+**Transformer-based:** RT-DETR-L, Deformable DETR
+
+All models trained under identical conditions: same effective batch size (16), same optimizer (AdamW), same scheduler (CosineAnnealingLR), AMP enabled, deterministic cuDNN, RTX 4060 8GB.
+
+## Dataset
+
+600 synthetic images generated in BrickPoint Studio 2.0, each containing all 10 brick classes. 6000 annotated instances total, annotated in CVAT.
+
+**10 brick classes across two groups:**
+
+Geometrically similar: `2x2`, `2x3`, `1x1`, `1x2`, `1x3`, `2x2corner`, `1x1round`, `1x1curved`
+
+Unique shapes: `2x2roundtile`, `panel1x2x1`
+
+Dataset split into four size variants (100 / 200 / 400 / 600 images) to measure scaling behavior.
+
+## Results
+
+### Validation set (best checkpoint, 600 images)
+
+| Model | mAP@50 | mAP@50-95 | Train time |
+|---|---|---|---|
+| RT-DETR-L | 0.946 | **0.885** | 898s |
+| YOLOv8s | 0.949 | 0.873 | 188s |
+| EfficientDet D1 | 0.951 | 0.848 | 1218s |
+| **Deformable DETR** | 0.923 | 0.815 | 3023s |
+| Faster R-CNN | 0.891 | 0.767 | 1508s |
+
+### Test set (600 images, harder scenes)
+
+| Model | mAP@50 | mAP@50-95 | Inference [ms/img] |
+|---|---|---|---|
+| **Deformable DETR** | - | **0.566** | 79.2 |
+| RT-DETR-L | 0.717 | 0.653 | 21.2 |
+| YOLOv8s | 0.690 | 0.607 | **8.8** |
+| EfficientDet D1 | 0.655 | 0.555 | 29.7 |
+| Faster R-CNN | 0.556 | 0.446 | 33.1 |
+
+The test set contained significantly harder scenes than validation: overlapping and adjacent bricks, varied lighting, and unknown brick types not seen during training. Deformable DETR's validation results underrepresented its actual generalization ability. The 79ms inference time, however, rules it out for real-time use.
+
+## Key Implementation Notes
+
+**Box format:** Dataset outputs normalized `[cx, cy, w, h]` (DETR convention), converted from COCO `[x, y, w, h]` via albumentations + manual normalization.
+
+**Label indexing:** COCO uses 1-indexed categories internally; DETR expects 0-indexed. The dataset converts on output, the evaluator converts back when building COCO predictions.
+
+**AMP dtype:** `bfloat16` instead of `float16` — more stable for transformer training on Ampere GPUs.
+
+**Gradient clipping:** `max_norm=0.1`, much tighter than typical CNN pipelines, which is standard for DETR-family models.
+
+**Effective batch size:** `batch_size=2` with `accumulation_steps=8` gives effective batch of 16, matching the other models in the study. Necessary due to Deformable DETR's high VRAM usage at 640px input.
 
 ## Project Structure
 
 ```
-project_root/
-│
+.
+├── train.py                       # entry point
+├── configs/
+│   └── deformable_detr.yaml       # all hyperparameters here
+└── src/
+    ├── config.py                  # dataclasses loading the YAML
+    ├── dataset.py                 # LegoDatasetDETR + box format conversion
+    ├── evaluator.py               # COCO eval via processor.post_process_object_detection
+    ├── trainer.py                 # Trainer, EarlyStopping, CheckpointManager, CsvLogger
+    └── utils.py                   # seed, collate_fn
+```
+
+## Setup
+
+```bash
+pip install torch torchvision transformers pycocotools albumentations opencv-python pyyaml
+```
+
+Dataset structure expected:
+
+```
+.
 ├── annotations/
 │   ├── instances_Train.json
 │   └── instances_Validation.json
-│
-├── images/
-│   ├── Train/
-│   └── Validation/
-│
-├── detr_best.pth
-├── detr_last.pth
-├── detr_last_checkpoint.pth
-├── training_results_detr.csv
-└── train.py
+└── images/
+    ├── Train/
+    └── Validation/
 ```
-
----
-
-## Requirements
-
-Install required dependencies:
-
-```bash
-pip install torch torchvision
-pip install opencv-python
-pip install numpy
-pip install albumentations
-pip install pycocotools
-pip install transformers
-```
-
----
-
-## Dataset Format
-
-The dataset must follow the COCO annotation format.
-
-### Images
-
-* Training images: `images/Train/`
-* Validation images: `images/Validation/`
-
-### Annotations
-
-* Training annotations: `annotations/instances_Train.json`
-* Validation annotations: `annotations/instances_Validation.json`
-
-Each annotation file must contain:
-
-* `images`
-* `annotations`
-* `categories`
-
-Bounding boxes are expected in COCO format: `[x, y, width, height]`.
-
----
-
-## Data Processing
-
-Images are:
-
-* Resized while preserving aspect ratio
-* Padded to a fixed resolution
-* Normalized using ImageNet statistics
-
-Bounding boxes are converted from COCO format to normalized center format required by DETR:
-
-```
-(cx, cy, width, height) in range [0, 1]
-```
-
----
-
-## Configuration
-
-All parameters are defined in the `Config` class:
-
-* `MODEL_ID` – pretrained model identifier
-* `IMG_SIZE` – input resolution
-* `BATCH_SIZE` – batch size
-* `ACCUMULATION_STEPS` – gradient accumulation steps
-* `EPOCHS` – number of training epochs
-* `LR` – learning rate
-* `PATIENCE` – early stopping patience
-* `DEVICE` – training device
-
-Paths for datasets, checkpoints, and logs are also configured here.
-
----
 
 ## Training
-
-Run training with:
 
 ```bash
 python train.py
 ```
 
-### Training Details
+Resumes automatically from `detr_last_checkpoint.pth` if present. To start fresh, set `resume: false` in the config or delete the checkpoint.
 
-* Model initialized from pretrained weights (`SenseTime/deformable-detr`)
-* Optimizer: AdamW
-* Scheduler: CosineAnnealingLR
-* Mixed precision with bfloat16 when CUDA is available
-* Gradient clipping for training stability
+Key config options in `configs/deformable_detr.yaml`:
 
----
-
-## Evaluation
-
-Evaluation is performed after each epoch using COCO metrics.
-
-Metrics include:
-
-* mAP (IoU 0.50:0.95)
-* mAP (IoU 0.50)
-* mAP (IoU 0.75)
-* mAP across object scales
-* Average Recall (AR)
-
-Predictions are post-processed using the corresponding Hugging Face image processor.
-
----
-
-## Checkpointing
-
-The training process automatically saves:
-
-* `detr_best.pth` – best-performing model (based on mAP)
-* `detr_last.pth` – latest model state
-* `detr_last_checkpoint.pth` – full training state
-
-Training resumes automatically if checkpoint loading is enabled.
-
----
-
-## Logging
-
-Training progress is stored in:
-
-```
-training_results_detr.csv
+```yaml
+training:
+  batch_size: 2
+  accumulation_steps: 8    # effective batch = 16
+  epochs: 200
+  learning_rate: 2.0e-4
+  grad_clip_norm: 0.1      # tight clipping standard for DETR-family
+  amp_dtype: bfloat16
 ```
 
-Each entry includes:
+## Environment
 
-* Epoch
-* Training loss
-* Validation loss
-* Learning rate
-* Execution time
-* COCO evaluation metrics
-
----
-
-## Early Stopping
-
-Training stops when no improvement in validation mAP is observed for a number of epochs defined by `PATIENCE`.
-
----
-
-## Reproducibility
-
-Random seeds are fixed across:
-
-* Python
-* NumPy
-* PyTorch (CPU and CUDA)
-
-This ensures deterministic and reproducible results.
-
----
-
-## Notes
-
-* The implementation handles images without annotations.
-* Label indices are adjusted to match DETR requirements (zero-based indexing).
-* Post-processing converts predictions back to COCO format for evaluation.
-
----
-
-## License
-
-No license is included by default. Add one if distribution is intended.
-
----
-
-## Acknowledgments
-
-* Deformable DETR model via Hugging Face Transformers
-* COCO evaluation tools via `pycocotools`
+- WSL2 / Ubuntu 22.04
+- CUDA 12.8 + cuDNN (deterministic mode)
+- NVIDIA RTX 4060 8GB
+- PyTorch with AMP (bfloat16)
